@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "sups.bluetooth-sound-control",
+  "name": "Bluetooth Sound Control",
+  "version": "1.0.0",
+  "author": "sups",
+  "description": "Toggle between high quality A2DP stereo playback and HFP headset microphone mode for Bluetooth audio devices.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Bluetooth Sound Control",
+    "description": "Control panel to manage Bluetooth audio modes, codecs, and auto-switching",
+    "category": "Audio",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

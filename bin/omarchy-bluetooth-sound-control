@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+#
+# omarchy-bluetooth-sound-control
+# Toggles between high quality stereo audio (A2DP) and headset microphone mode (HFP/HSP)
+# for connected Bluetooth audio devices under PipeWire/WirePlumber.
+
+set -euo pipefail
+
+get_connected_card() {
+  pactl list cards short 2>/dev/null | awk '$2 ~ /^bluez_card/ {if (!found) {print $2; found=1}}'
+}
+
+get_device_description() {
+  local card="$1"
+  pactl list cards 2>/dev/null | awk -v c="$card" '
+    $1 == "Name:" && $2 == c {f=1}
+    f && /device.description =/ {if (!found) {gsub(/.*= "|"/, ""); print; found=1}}
+  '
+}
+
+get_active_profile() {
+  local card="$1"
+  pactl list cards 2>/dev/null | awk -v c="$card" '
+    $1 == "Name:" && $2 == c {f=1}
+    f && /Active Profile:/ {if (!found) {print $3; found=1}}
+  '
+}
+
+get_codec_name() {
+  local card="$1"
+  local prof="$2"
+  pactl list cards 2>/dev/null | awk -v c="$card" -v p="$prof" '
+    $1 == "Name:" && $2 == c {f=1}
+    f && $1 == p ":" {
+      match($0, /codec [^)]+/)
+      if (RSTART > 0) {
+        print substr($0, RSTART + 6, RLENGTH - 6)
+        exit
+      }
+    }
+  '
+}
+
+get_autoswitch_setting() {
+  wpctl settings 2>/dev/null | awk '
+    $0 ~ /bluetooth\.autoswitch-to-headset-profile/ {f=1}
+    f && /Value:/ {if (!found) {print $2; found=1}}
+  '
+}
+
+get_a2dp_profile() {
+  local card="$1"
+  pactl list cards 2>/dev/null | awk -v c="$card" '
+    $1 == "Name:" && $2 == c {f=1}
+    f && /Profiles:/ {in_p=1; next}
+    in_p && /Active Profile:/ {in_p=0}
+    in_p && /a2dp-sink/ {
+      sub(/:$/, "", $1)
+      if ($1 == "a2dp-sink") best=$1
+      else if (!best) fallback=$1
+    }
+    END {if (best) print best; else if (fallback) print fallback}
+  '
+}
+
+get_headset_profile() {
+  local card="$1"
+  pactl list cards 2>/dev/null | awk -v c="$card" '
+    $1 == "Name:" && $2 == c {f=1}
+    f && /Profiles:/ {in_p=1; next}
+    in_p && /Active Profile:/ {in_p=0}
+    in_p && /headset-head-unit/ {
+      sub(/:$/, "", $1)
+      if ($1 == "headset-head-unit") best=$1
+      else if (!best) fallback=$1
+    }
+    END {if (!found && fallback) print fallback}
+  '
+}
+
+get_builtin_source() {
+  pactl list sources short 2>/dev/null | awk '$2 ~ /alsa_input/ && $2 ~ /analog-stereo/ {if (!found) {print $2; found=1}}'
+}
+
+notify() {
+  local icon="$1"
+  local msg="$2"
+  if command -v omarchy-osd >/dev/null 2>&1; then
+    omarchy-osd -i "$icon" -m "$msg" >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send -i "$icon" "Bluetooth Audio" "$msg" >/dev/null 2>&1 || true
+  fi
+}
+
+set_a2dp() {
+  local card
+  card="$(get_connected_card)"
+  if [[ -z "$card" ]]; then
+    echo "No Bluetooth audio device connected." >&2
+    return 1
+  fi
+
+  local a2dp_prof
+  a2dp_prof="$(get_a2dp_profile "$card")"
+  if [[ -z "$a2dp_prof" ]]; then
+    echo "No A2DP profile found for $card." >&2
+    return 1
+  fi
+
+  # 1. Disable WirePlumber auto-switching so capture requests don't drop to HFP
+  wpctl settings bluetooth.autoswitch-to-headset-profile false >/dev/null 2>&1 || true
+
+  # 2. Set card profile to A2DP
+  pactl set-card-profile "$card" "$a2dp_prof"
+
+  # 3. If a built-in microphone exists, set it as default source and unmute it
+  local builtin_src
+  builtin_src="$(get_builtin_source)"
+  if [[ -n "$builtin_src" ]]; then
+    pactl set-default-source "$builtin_src" >/dev/null 2>&1 || true
+    pactl set-source-mute "$builtin_src" 0 >/dev/null 2>&1 || true
+  fi
+
+  local desc
+  desc="$(get_device_description "$card")"
+  notify "audio-headphones" "${desc:-Bluetooth}: High Quality (A2DP)"
+  echo "Switched $card to $a2dp_prof (Autoswitch: disabled)"
+}
+
+set_hfp() {
+  local card
+  card="$(get_connected_card)"
+  if [[ -z "$card" ]]; then
+    echo "No Bluetooth audio device connected." >&2
+    return 1
+  fi
+
+  local hfp_prof
+  hfp_prof="$(get_headset_profile "$card")"
+  if [[ -z "$hfp_prof" ]]; then
+    echo "No Headset/HFP profile found for $card." >&2
+    return 1
+  fi
+
+  # 1. Enable WirePlumber auto-switching
+  wpctl settings bluetooth.autoswitch-to-headset-profile true >/dev/null 2>&1 || true
+
+  # 2. Switch card to Headset profile
+  pactl set-card-profile "$card" "$hfp_prof"
+
+  local desc
+  desc="$(get_device_description "$card")"
+  notify "audio-headset" "${desc:-Bluetooth}: Headset Mic (HFP)"
+  echo "Switched $card to $hfp_prof (Autoswitch: enabled)"
+}
+
+set_autoswitch() {
+  local target="${1:-toggle}"
+  local current
+  current="$(get_autoswitch_setting)"
+  local next
+  if [[ "$target" == "toggle" ]]; then
+    if [[ "$current" == "true" ]]; then next="false"; else next="true"; fi
+  elif [[ "$target" == "on" || "$target" == "true" ]]; then
+    next="true"
+  else
+    next="false"
+  fi
+  wpctl settings bluetooth.autoswitch-to-headset-profile "$next"
+  echo "Autoswitch set to $next"
+}
+
+show_status() {
+  local json_format="${1:-false}"
+  local card
+  card="$(get_connected_card)"
+  local autoswitch
+  autoswitch="$(get_autoswitch_setting)"
+
+  if [[ -z "$card" ]]; then
+    if [[ "$json_format" == "true" ]]; then
+      printf '{"connected":false,"mode":"none","label":"Disconnected","icon":"audio-headphones","codec":"","autoswitch":%s}\n' "${autoswitch:-false}"
+    else
+      echo "No Bluetooth audio device connected."
+      echo "Autoswitch setting: ${autoswitch:-unknown}"
+    fi
+    return 0
+  fi
+
+  local desc prof mode label icon codec builtin_src
+  desc="$(get_device_description "$card")"
+  prof="$(get_active_profile "$card")"
+  codec="$(get_codec_name "$card" "$prof")"
+  builtin_src="$(get_builtin_source)"
+
+  if [[ "$prof" =~ headset|hfp|hsp ]]; then
+    mode="hfp"
+    label="Headset Mic"
+    icon="audio-headset"
+  else
+    mode="a2dp"
+    label="High Quality"
+    icon="audio-headphones"
+  fi
+
+  if [[ "$json_format" == "true" ]]; then
+    printf '{"connected":true,"card":"%s","device":"%s","profile":"%s","codec":"%s","mode":"%s","label":"%s","icon":"%s","autoswitch":%s,"builtin_mic":"%s"}\n' \
+      "$card" "$desc" "$prof" "${codec:-Auto}" "$mode" "$label" "$icon" "${autoswitch:-false}" "${builtin_src:-none}"
+  else
+    echo "Device:       ${desc:-Unknown} ($card)"
+    echo "Active Mode:  $label ($prof)"
+    echo "Codec:        ${codec:-Auto}"
+    echo "Autoswitch:   ${autoswitch:-unknown}"
+  fi
+}
+
+toggle() {
+  local card
+  card="$(get_connected_card)"
+  if [[ -z "$card" ]]; then
+    echo "No Bluetooth audio device connected." >&2
+    return 1
+  fi
+
+  local prof
+  prof="$(get_active_profile "$card")"
+  if [[ "$prof" =~ headset|hfp|hsp ]]; then
+    set_a2dp
+  else
+    set_hfp
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <command> [options]
+
+Commands:
+  toggle              Switch between A2DP (High Quality) and HFP (Headset Mic)
+  a2dp | hq           Switch to high quality stereo playback (disables autoswitch)
+  hfp  | mic          Switch to headset microphone mode (enables autoswitch)
+  autoswitch [on|off] Change WirePlumber auto-switching setting
+  status              Show current Bluetooth audio device status
+  status --json       Output status in JSON format
+EOF
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  toggle)
+    toggle
+    ;;
+  a2dp|hq)
+    set_a2dp
+    ;;
+  hfp|mic)
+    set_hfp
+    ;;
+  autoswitch)
+    set_autoswitch "${2:-toggle}"
+    ;;
+  status)
+    if [[ "${2:-}" == "--json" ]]; then
+      show_status true
+    else
+      show_status false
+    fi
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac
